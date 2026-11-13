@@ -889,6 +889,11 @@ function handle(request) {
       reject(request.id, -32000, 'expected turn is not active');
       return;
     }
+    const goalSteerResponse = process.env.FAKE_CODEX_GOAL_STEER_RESPONSE;
+    if (goalSteerResponse) {
+      respond(request.id, goalSteerResponse === 'missing' ? {} : { turnId: goalSteerResponse });
+      return;
+    }
     respond(request.id, { turnId: goalTurn.id });
     const user = {
       id: 'user-goal-steer',

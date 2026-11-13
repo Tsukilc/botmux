@@ -93,6 +93,9 @@ interface ActiveTurn {
   pendingCompletions: JsonObject[];
   pendingNotifications: JsonObject[];
   serverStarted: boolean;
+  /** This Botmux root's acceptance was published once, even if its native
+   * target already existed as an autonomous Goal continuation. */
+  workerRootAcceptancePublished?: boolean;
   startedAtMs: number;
   lastActivityMarkerAtMs: number;
   finalText: string;
@@ -1353,6 +1356,7 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
         if (!proveCanonicalExact(turn, startedId, 'exact_started')) return;
         if (!turn.nativeTurnId) turn.nativeTurnId = startedId;
         if (turn.phase === undefined || turn.phase === 'starting') turn.phase = 'open';
+        publishRootInputAccepted(turn);
       }
       if (turn.nativeTurnId === startedId) {
         turn.serverStarted = true;
@@ -1477,6 +1481,13 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
         return;
       }
       if (exact.length === 1) {
+        // A Goal-root steer is its own Botmux dispatch. Even an exact native
+        // completion must wait for the matching steer response before it can
+        // settle/publish this new root's acceptance.
+        if (turn.requestKind === 'steer' && !turn.requestAccepted) {
+          turn.pendingCompletions.push(nativeTurn);
+          return;
+        }
         completeActiveTurnFromNative(turn, nativeTurn, exact[0]);
         return;
       }
@@ -1773,6 +1784,21 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
  *  daemon as a "收到,引导成功" edge and treats fatal as a control-generation kill. */
 function emitLifecycle(event: JsonObject): void {
   emitMarker('lifecycle', { atMs: Date.now(), ...event });
+}
+
+/** The legacy wire name `turn_started` marks acceptance of a BOTMUX root.
+ * A successful Goal-root steer starts a new logical dispatch on an existing
+ * appTurnId; a bare autonomous notification and an in-group follow-up do not. */
+function publishRootInputAccepted(turn: ActiveTurn): void {
+  const replyTurnId = turn.accepted?.[0]?.replyTurnId;
+  const appTurnId = turn.canonicalNativeTurnId;
+  if (turn.workerRootAcceptancePublished || turn.completed || generationFenced
+    || !replyTurnId || !appTurnId
+    || (turn.requestKind === 'steer' && !turn.requestAccepted)
+    || (turn.identityProof !== 'exact_started' && turn.identityProof !== 'start_response'
+      && !(turn.requestKind === 'steer' && turn.identityProof === 'goal_snapshot'))) return;
+  turn.workerRootAcceptancePublished = true;
+  emitLifecycle({ kind: 'turn_started', appTurnId, replyTurnId });
 }
 
 /**
@@ -2403,6 +2429,13 @@ async function runTurn(message: QueuedInput): Promise<void> {
       });
     }
   }
+  // Goal-root acceptance, like in-group steering, must acknowledge the exact
+  // captured native target. A snapshot alone is not proof the input landed.
+  if (expectedSteerTurnId && result?.turnId !== expectedSteerTurnId) {
+    fenceUnknown('turn/steer', 'protocol', turn);
+    if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
+    return;
+  }
   const responseNativeId = result.turn?.id ?? result.turnId ?? turn.nativeTurnId;
   // B1/R4-B2 late start response: if an exact proof (turn/started OR completed)
   // already bound a canonical id, the start response MUST match it — a divergent
@@ -2431,6 +2464,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
       turn.identityProof = turn.requestKind === 'steer' ? 'goal_snapshot' : 'start_response';
     }
     if (turn.phase === undefined || turn.phase === 'starting') turn.phase = 'open';
+    publishRootInputAccepted(turn);
   }
   // A response may arrive after its turn completed or after a Goal
   // continuation B already started. Never resurrect the completed lifecycle,

@@ -1206,6 +1206,14 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       'om_integration_1',
       'om_integration_2',
     ]);
+    // The real runner must publish each native start over the signed channel;
+    // submitted/progress and automatic final delivery alone cannot advance the
+    // worker's type-ahead identity when no idle occurs between these turns.
+    expect(result.markers.filter(marker => marker.kind === 'lifecycle'
+      && marker.payload.kind === 'turn_started').map(marker => marker.payload)).toEqual([
+      expect.objectContaining({ appTurnId: 'turn-fake-1', replyTurnId: 'om_integration_1' }),
+      expect.objectContaining({ appTurnId: 'turn-fake-2', replyTurnId: 'om_integration_2' }),
+    ]);
     expect(result.output.match(/› /g)).toHaveLength(2);
 
     // One idle state belongs to initialized startup and one to the fully
@@ -1464,6 +1472,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         control.finals.length === 1
         && control.states.some(state => state.busy === true && state.tracksTurn === false)
       ));
+      // Autonomous native work alone cannot publish a new Botmux identity.
+      expect(control.markers.filter(marker => marker.kind === 'lifecycle'
+        && marker.payload.kind === 'turn_started').map(marker => marker.payload.replyTurnId)).toEqual(['om_goal_a']);
       // The follow-up steers into the autonomous Goal turn — under the B3 gate
       // that requires an explicit daemon steer authorization (codexAppSteerable).
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('confirm legacy', sidecar('confirm', 'om_goal_confirm'), 'om_goal_confirm', true)}\r`);
@@ -1492,6 +1503,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           content: 'goal steer answer',
         }),
       ]);
+      // The Goal steer is an independent Botmux root, despite reusing the
+      // existing native id and having no idle edge after the previous final.
+      expect(control.markers.filter(marker => marker.kind === 'lifecycle'
+        && marker.payload.kind === 'turn_started').map(marker => marker.payload)).toEqual([
+        expect.objectContaining({ appTurnId: 'turn-fake-1', replyTurnId: 'om_goal_a' }),
+        expect.objectContaining({ appTurnId: 'turn-goal-auto', replyTurnId: 'om_goal_confirm' }),
+      ]);
       const firstEnd = control.markers.findIndex(marker =>
         marker.kind === 'final-end' && marker.payload.id?.startsWith('om_goal_a:'));
       const secondStart = control.markers.findIndex(marker =>
@@ -1503,6 +1521,35 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       await stopChild(harness.child);
       await control.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['wrong-native-target', 'missing'])('does not accept a Goal-root steer from a %s response', async response => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-goal-root-acceptance-'));
+    const fakeCodex = join(dir, 'fake-codex'); const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.1', 'goal-continuation', control.bootstrap.path,
+      { env: { FAKE_CODEX_GOAL_STEER_RESPONSE: response } });
+    const send = (id: string) => harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+      id, { text: id, clientUserMessageId: id }, id, true,
+    )}\r`);
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('om_goal_first');
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.some(state => state.busy === true && state.tracksTurn === false));
+      send('om_goal_rejected');
+      await waitFor(harness, () => control.markers.some(marker => marker.kind === 'lifecycle'
+        && marker.payload.kind === 'fatal'));
+      expect(control.markers.filter(marker => marker.kind === 'lifecycle'
+        && marker.payload.kind === 'turn_started').map(marker => marker.payload.replyTurnId)).toEqual(['om_goal_first']);
+      expect(control.finals).toHaveLength(1);
+      expect(control.markers).toContainEqual({ kind: 'lifecycle', payload: expect.objectContaining({
+        kind: 'fatal', operation: 'turn/steer', category: 'protocol',
+      }) });
+    } finally {
+      await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -1611,6 +1658,8 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // request so the follow-up races the pending response.
       send('root', rootTurnId);
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      await waitFor(harness, () => control.markers.some(marker => marker.kind === 'lifecycle'
+        && marker.payload.kind === 'turn_started' && marker.payload.replyTurnId === rootTurnId));
       // Follow-up arrives while the root start response is STILL pending.
       send('follow', 'om_sr_follow');
 
@@ -1636,6 +1685,12 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         .filter(m => m.kind === 'lifecycle' && m.payload.kind === 'steer_accepted')
         .map(m => m.payload.replyTurnId);
       expect(accepted).toEqual(['om_sr_follow']);
+      // Exact started notification and its later RPC response prove the same
+      // start only once. The accepted follow-up remains a steer, not a start.
+      expect(control.markers.filter(marker => marker.kind === 'lifecycle'
+        && marker.payload.kind === 'turn_started').map(marker => marker.payload)).toEqual([
+        expect.objectContaining({ appTurnId: 'turn-fake-1', replyTurnId: rootTurnId }),
+      ]);
     } finally {
       await stopChild(harness.child);
       await control.close();

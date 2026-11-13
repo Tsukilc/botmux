@@ -7633,8 +7633,13 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
   return anySynced;
 }
 
-function advanceQueuedTypeAheadTurn(reason: string): boolean {
-  if (syncQueuedTurnsFromMarkerDisk()) return true;
+function advanceQueuedTypeAheadTurn(
+  reason: string,
+  expected?: { turnId: string; dispatchAttempt?: number },
+): boolean {
+  // The native-start caller already locked and checked the exact marker head.
+  // A generic disk sync here could adopt a different turn before this fence.
+  if (!expected && syncQueuedTurnsFromMarkerDisk()) return true;
   while (queuedTypeAheadTurns[0]
     && turnTerminalEmitted(queuedTypeAheadTurns[0].turnId, queuedTypeAheadTurns[0].dispatchAttempt)) {
     const finished = queuedTypeAheadTurns[0];
@@ -7642,6 +7647,10 @@ function advanceQueuedTypeAheadTurn(reason: string): boolean {
     log(`Skipped type-ahead turn ${finished.turnId.slice(0, 12)} whose terminal already went out (${reason})`);
   }
   if (queuedTypeAheadTurns.length === 0) return false;
+  // Native start can advance only the exact reservation it acknowledged, not
+  // another queued input that happened to become the head in the meantime.
+  if (expected && (queuedTypeAheadTurns[0].turnId !== expected.turnId
+    || queuedTypeAheadTurns[0].dispatchAttempt !== expected.dispatchAttempt)) return false;
   const next = queuedTypeAheadTurns.shift()!;
   const prevTurnId = currentBotmuxTurnId;
   markTurnRetired(prevTurnId);
@@ -18668,6 +18677,73 @@ function restoreCodexAppAttestedTurn(
   log('Restored active Codex App human turn from the authenticated generation and exact durable dispatch');
 }
 
+function codexAppInputControlIsCurrent(
+  control?: { generation: string; seq: number },
+): boolean {
+  if (!isCodexAppCliId(lastInitConfig?.cliId) || !control
+    || !codexAppControlProven || codexAppControlFatal
+    || (!codexAppEngineIdentity && !codexAppRunnerProcessIdentity)
+    || codexAppControlStateValue?.status !== 'active'
+    || codexAppControlStateValue.identities.length !== 1
+    || codexAppControlStateValue.identities[0].generation !== control.generation
+    || !Number.isSafeInteger(control.seq) || control.seq <= 0
+    || committedCodexAppSequence(codexAppGenerationCommits, control.generation, control.seq)
+    || closeRequested || cliRestartInProgress || !hasCurrentSessionRuntime()) return false;
+  return true;
+}
+
+/** Signed acceptance of an independent Botmux root (native start or Goal-root
+ * steer) is a boundary even without a terminal prompt/idle edge. */
+function acceptCodexAppStartedInput(
+  turnId: string,
+  control?: { generation: string; seq: number },
+): boolean {
+  if (!codexAppInputControlIsCurrent(control) || codexAppCompletionAwaitingFinal) return false;
+
+  // The runner supplies only the reply id; attempt and FIFO ordering remain
+  // worker-owned. Read the exact head without settling or consuming it.
+  const head = codexAppTurnDispatchQueue.settleFinal({ turnId }, false);
+  if (!head.ok || turnTerminalEmitted(head.turnId, head.dispatchAttempt)) return false;
+  const markerPaths = [cliPidMarker, rpcEnginePidMarker].filter((path): path is string => !!path);
+  const apply = (): boolean => {
+    const sameCurrent = currentBotmuxTurnId === head.turnId
+      && currentBotmuxDispatchAttempt === head.dispatchAttempt;
+    if (!sameCurrent && currentBotmuxTurnId
+      && !turnTerminalEmitted(currentBotmuxTurnId, currentBotmuxDispatchAttempt)) return false;
+    const next = queuedTypeAheadTurns.find(turn => !turnTerminalEmitted(turn.turnId, turn.dispatchAttempt));
+    if (!sameCurrent && (!next || next.turnId !== head.turnId || next.dispatchAttempt !== head.dispatchAttempt)) return false;
+    const active = activeTurnAuthority.snapshot();
+    if (active?.turnId && (active.turnId !== head.turnId || active.dispatchAttempt !== head.dispatchAttempt)
+      && !turnTerminalEmitted(active.turnId, active.dispatchAttempt)) return false;
+
+    // writeCliPidMarker also adopts an advanced disk head. Reject a different
+    // head under BOTH marker locks before any identity or queue mutation.
+    for (const path of markerPaths) {
+      if (!existsSync(path)) continue;
+      let marker: { sessionId?: string; turnId?: string; dispatchAttempt?: unknown };
+      try { marker = JSON.parse(readFileSync(path, 'utf8')); } catch { return false; }
+      if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return false;
+      const attempt = typeof marker.dispatchAttempt === 'number' ? marker.dispatchAttempt : undefined;
+      if (marker.sessionId !== sessionId
+        || !((marker.turnId === currentBotmuxTurnId && attempt === currentBotmuxDispatchAttempt)
+          || (marker.turnId === head.turnId && attempt === head.dispatchAttempt))) return false;
+    }
+    if (sameCurrent) {
+      markReplyInputConsumed(head.turnId);
+      return true;
+    }
+    // 旧轮次已结束且原生启动精确匹配队首，调用者仅来自保存的队列记录。
+    next!.inputConsumed = true;
+    releaseTerminatedActiveTurnAuthority();
+    return advanceQueuedTypeAheadTurn('codex_app_turn_started', head);
+  };
+  const underLocks = (index: number): boolean => {
+    const path = markerPaths[index];
+    return path ? withPidMarkerLock(path, () => underLocks(index + 1)) : apply();
+  };
+  return underLocks(0);
+}
+
 async function handleTrustedCodexAppMarker(
   kind: string,
   payload: Record<string, unknown>,
@@ -18730,8 +18806,8 @@ async function handleTrustedCodexAppMarker(
 
   // master added lifecycle/steer markers. In the merged world codex-app reaches
   // this handler over the signed socket (PR #597 moved it off terminal OSC), so
-  // the branch lives here rather than in handleAppRunnerOscMarker. These events
-  // are informational (steer-ack correlation); a malformed or unmatched event is
+  // the branch lives here rather than in handleAppRunnerOscMarker. The events
+  // correlate native starts/steers; a malformed or unmatched event is
   // logged/ignored but still counts as successfully applied so the signed record
   // is ACKed rather than destroying the control socket.
   if (kind === 'lifecycle') {
@@ -18759,6 +18835,10 @@ async function handleTrustedCodexAppMarker(
       );
       return false;
     }
+    if (event.kind === 'turn_started' && event.replyTurnId) {
+      acceptCodexAppStartedInput(event.replyTurnId, control);
+      return true;
+    }
     if (!event.replyTurnId || !submittedCodexAppReplyTurnIds.has(event.replyTurnId)) return true;
     if (event.kind === 'steer_attempt') {
       rememberBoundedMap(pendingCodexAppSteerAckIds, event.replyTurnId, event.appTurnId);
@@ -18770,6 +18850,13 @@ async function handleTrustedCodexAppMarker(
       || acknowledgedCodexAppSteers.has(steerKey)) return true;
     pendingCodexAppSteerAckIds.delete(event.replyTurnId);
     rememberBounded(acknowledgedCodexAppSteers, steerKey);
+    // An accepted steer changes reply coverage, not the running execution or
+    // its frozen caller/controller. Never promote its queued turn here.
+    const steered = codexAppTurnDispatchQueue.findByTurnId(event.replyTurnId);
+    if (codexAppInputControlIsCurrent(control) && steered
+      && !turnTerminalEmitted(steered.turnId, steered.dispatchAttempt)) {
+      markReplyInputConsumed(steered.turnId);
+    }
     send({
       type: 'steer_accepted',
       appTurnId: event.appTurnId,
