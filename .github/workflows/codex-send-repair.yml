@@ -35,6 +35,7 @@ jobs:
           bun run test --
           test/dashboard-row-reply-context.test.ts
           test/resolve-session-by-id.test.ts
+          test/worker-codex-app-native-input-attribution.test.ts
           test/worker-codex-app-input-proof.test.ts
           test/worker-codex-app-final-origin.test.ts
           test/worker-codex-app-protocol-merge-adversarial.test.ts
