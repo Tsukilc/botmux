@@ -2108,14 +2108,15 @@ ipcRoute('GET', '/api/sessions/:sessionId/workspace', async (req, res, params) =
 });
 
 ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
+  const rowOptions = { includeTurnReplyContexts: isTrustedHostIpcRequest(_req) };
   const ds = findActiveBySessionId(params.sessionId);
-  if (ds) return jsonRes(res, 200, { session: composeRowFromActive(ds) });
+  if (ds) return jsonRes(res, 200, { session: composeRowFromActive(ds, rowOptions) });
   const persisted = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
   if (persisted) {
     return jsonRes(res, 200, {
       session: persisted.status === 'active'
-        ? composeRowFromPersistedActive(persisted)
-        : composeRowFromClosed(persisted),
+        ? composeRowFromPersistedActive(persisted, rowOptions)
+        : composeRowFromClosed(persisted, rowOptions),
     });
   }
   jsonRes(res, 404, { error: 'not_found' });

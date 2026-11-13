@@ -173,6 +173,8 @@ export interface SessionRow extends SessionMessagePreview {
   gitBranch?: string;
   /** Per-turn reply anchors — `botmux send` prefers these over the topic root. */
   replyTargets?: Record<string, ReplyTargetEntry>;
+  /** CLI 校验 --reply-to 时需要原始入站消息的回复上下文。 */
+  turnReplyContexts?: Session['turnReplyContexts'];
   currentReplyTarget?: Session['currentReplyTarget'];
   quoteTargetId?: string;
   quoteTargetSenderOpenId?: string;
@@ -182,13 +184,15 @@ export interface SessionRow extends SessionMessagePreview {
 function composeSendRoutingFields(
   s: Session,
   runtimeCurrentReplyTarget?: Session['currentReplyTarget'],
+  includeTurnReplyContexts = false,
 ): Pick<
   SessionRow,
-  'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'codexAppDispatchLedger'
+  'replyTargets' | 'turnReplyContexts' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'codexAppDispatchLedger'
 > {
   const currentReplyTarget = runtimeCurrentReplyTarget ?? s.currentReplyTarget;
   return {
     ...(s.replyTargets ? { replyTargets: s.replyTargets } : {}),
+    ...(includeTurnReplyContexts && s.turnReplyContexts ? { turnReplyContexts: s.turnReplyContexts } : {}),
     ...(currentReplyTarget ? { currentReplyTarget } : {}),
     ...(s.quoteTargetId ? { quoteTargetId: s.quoteTargetId } : {}),
     ...(s.quoteTargetSenderOpenId ? { quoteTargetSenderOpenId: s.quoteTargetSenderOpenId } : {}),
@@ -341,6 +345,8 @@ function sandboxDriftField(s: Session): Pick<SessionRow, 'sandboxDrift'> {
 
 export interface DashboardRowOptions {
   fresh?: boolean;
+  /** 仅内部单会话详情启用；列表和事件流不发布入站消息上下文。 */
+  includeTurnReplyContexts?: boolean;
   /**
    * Expensive native transcript/token scan. Dashboard list snapshots can contain
    * thousands of historical rows, so callers that only need routing/status
@@ -450,7 +456,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
     ...sandboxDriftField(ds.session),
     ...buildSessionMessagePreview(ds.session),
-    ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
+    ...composeSendRoutingFields(ds.session, ds.currentReplyTarget, opts?.includeTurnReplyContexts),
   };
 }
 
@@ -507,7 +513,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     ...(topicId ? { threadId: topicId } : {}),
     ...maybeSessionRowUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
-    ...composeSendRoutingFields(s),
+    ...composeSendRoutingFields(s, undefined, opts?.includeTurnReplyContexts),
   };
 }
 
@@ -573,6 +579,6 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     ...sandboxDriftField(s),
     ...maybeSessionRowUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
-    ...composeSendRoutingFields(s),
+    ...composeSendRoutingFields(s, undefined, opts?.includeTurnReplyContexts),
   };
 }
